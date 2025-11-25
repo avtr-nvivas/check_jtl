@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import csv
 import sys
 import os
@@ -230,8 +231,18 @@ def check_slas(jtl_file: str) -> None:
 # =========================================================
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: python check_slas.py <archivo_jtl>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("jtl_file")
+    parser.add_argument("--threads",  type=str, default=os.getenv("THREADS", "0"))
+    parser.add_argument("--rampup",   type=str, default=os.getenv("RAMP_UP", "0"))
+    parser.add_argument("--duration", type=str, default=os.getenv("DURATION", "0"))
+    args = parser.parse_args()
 
-    check_slas(sys.argv[1])
+    # Si tu script ya genera summary.json, usa args.threads/args.rampup/args.duration
+    # cuando armes el JSON. Ej:
+    # summary["threads"] = float(args.threads) si viene numérico o déjalo string.
+    # summary["rampup"] = float(args.rampup)
+    # summary["duration"] = float(args.duration)
+
+    check_slas(args.jtl_file)
+
