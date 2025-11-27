@@ -146,6 +146,9 @@ def check_slas(
     summary = {
         "test_name": test_name,
         "timestamp": utc_now_iso(),
+        
+        "status": "SUCCESS" if slas_passed else "FAIL",
+        "status_label": "OK ✅" if slas_passed else "FAIL ❌",
 
         "threads": int(threads),
         "rampup": int(rampup),
