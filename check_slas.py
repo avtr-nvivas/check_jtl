@@ -5,35 +5,49 @@ import sys
 import os
 import json
 from datetime import datetime
+from typing import Optional
 
 # =========================================================
 # === Definición de Umbrales (SLAs) ===
 # =========================================================
-# Umbrales Generales
-MAX_ERROR_RATE_TOTAL = 1.0   # Máximo 1.0% de errores globales
-MAX_AVG_LATENCY      = 3000  # Máximo 3000 ms (3 segundos) de tiempo de respuesta promedio
+MAX_ERROR_RATE_TOTAL = 1.0   # %
+MAX_AVG_LATENCY      = 3000  # ms
+MIN_TPS              = 5     # tps
 
-# Umbrales Específicos
-MIN_TPS              = 5     # Mínimo 5 Transacciones por Segundo
+def safe_int(v, default=0) -> int:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
-# =========================================================
-# === Función principal de chequeo de SLAs ===
-# =========================================================
+def utc_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def check_slas(jtl_file: str) -> None:
+def check_slas(
+    jtl_file: str,
+    threads: int,
+    rampup: int,
+    duration: int,
+    test_name: str,
+    repo: str,
+    jmx: str,
+    out_path: str,
+) -> int:
     """Procesa el archivo JTL, verifica los SLAs y genera summary.json."""
-
     total_samples   = 0
     total_errors    = 0
     total_latency   = 0
 
-    # Para TPS
     min_start_time  = float('inf')
     max_end_time    = float('-inf')
 
-    # Para métricas adicionales
     http_500        = 0
-    latencies_ms    = []  # para percentiles
+    latencies_ms    = []
 
     try:
         with open(jtl_file, 'r', newline='', encoding='utf-8', errors='replace') as f:
@@ -41,15 +55,14 @@ def check_slas(jtl_file: str) -> None:
 
             for row in reader:
                 success       = row.get('success', 'false')
-                elapsed       = int(row.get('elapsed', 0))
-                timestamp     = int(row.get('timeStamp', 0))
-                response_code = row.get('responseCode', '')
+                elapsed       = safe_int(row.get('elapsed', 0), 0)
+                timestamp     = safe_int(row.get('timeStamp', 0), 0)
+                response_code = (row.get('responseCode', '') or '').strip()
 
                 total_samples += 1
                 total_latency += elapsed
                 latencies_ms.append(elapsed)
 
-                # Tiempos para TPS
                 current_start_time = timestamp
                 current_end_time   = timestamp + elapsed
 
@@ -58,40 +71,34 @@ def check_slas(jtl_file: str) -> None:
                 if current_end_time > max_end_time:
                     max_end_time = current_end_time
 
-                # Errores (success != true)
-                if success.lower() != 'true':
+                if str(success).lower() != 'true':
                     total_errors += 1
 
-                # Errores HTTP 5xx
                 if response_code.startswith('5'):
                     http_500 += 1
 
     except FileNotFoundError:
         print(f"ERROR: Archivo de resultados {jtl_file} no encontrado.")
-        sys.exit(1)
+        return 1
 
     if total_samples == 0:
         print("ERROR: No se encontraron muestras en el archivo JTL.")
-        sys.exit(1)
+        return 1
 
-    # =========================================================
-    # CÁLCULO DE MÉTRICAS FINALES
-    # =========================================================
-
+    # =========================
+    # Métricas
+    # =========================
     error_rate = (total_errors / total_samples) * 100.0
     avg_latency = total_latency / total_samples
 
-    # TPS: duración total en ms → s
     total_duration_ms = max_end_time - min_start_time
     total_duration_s  = total_duration_ms / 1000.0 if total_duration_ms > 0 else 0.0
     tps = total_samples / total_duration_s if total_duration_s > 0 else 0.0
 
-    # Percentiles (p90 / p95)
     latencies_ms_sorted = sorted(latencies_ms)
     n = len(latencies_ms_sorted)
 
     def percentile(p: float) -> float:
-        """Calcula el percentil p (0.0–1.0) de la lista de latencias."""
         if n == 0:
             return 0.0
         idx = int(round(p * (n - 1)))
@@ -103,96 +110,49 @@ def check_slas(jtl_file: str) -> None:
     samples_ok = total_samples - total_errors
     samples_ko = total_errors
 
-    # =========================================================
-    # EVALUACIÓN DE SLAs
-    # =========================================================
-
+    # =========================
+    # Evaluación de SLAs
+    # =========================
     slas_passed = True
     sla_reasons = []
 
-    # 1. Errores 5xx
     if http_500 > 0:
         slas_passed = False
-        sla_reasons.append(
-            f"Se detectaron {http_500} respuestas HTTP 5xx (no se permiten)."
-        )
+        sla_reasons.append(f"Se detectaron {http_500} respuestas HTTP 5xx (no se permiten).")
     else:
         sla_reasons.append("Sin respuestas HTTP 5xx (OK).")
 
-    # 2. Tasa de error global
     if error_rate > MAX_ERROR_RATE_TOTAL:
         slas_passed = False
-        sla_reasons.append(
-            f"Tasa de error global {error_rate:.2f}% > límite {MAX_ERROR_RATE_TOTAL:.2f}%."
-        )
+        sla_reasons.append(f"Tasa de error global {error_rate:.2f}% > límite {MAX_ERROR_RATE_TOTAL:.2f}%.")
     else:
-        sla_reasons.append(
-            f"Tasa de error global {error_rate:.2f}% ≤ límite {MAX_ERROR_RATE_TOTAL:.2f}% (OK)."
-        )
+        sla_reasons.append(f"Tasa de error global {error_rate:.2f}% ≤ límite {MAX_ERROR_RATE_TOTAL:.2f}% (OK).")
 
-    # 3. Latencia promedio
     if avg_latency > MAX_AVG_LATENCY:
         slas_passed = False
-        sla_reasons.append(
-            f"Latencia promedio {avg_latency:.2f} ms > límite {MAX_AVG_LATENCY} ms."
-        )
+        sla_reasons.append(f"Latencia promedio {avg_latency:.2f} ms > límite {MAX_AVG_LATENCY} ms.")
     else:
-        sla_reasons.append(
-            f"Latencia promedio {avg_latency:.2f} ms ≤ límite {MAX_AVG_LATENCY} ms (OK)."
-        )
+        sla_reasons.append(f"Latencia promedio {avg_latency:.2f} ms ≤ límite {MAX_AVG_LATENCY} ms (OK).")
 
-    # 4. TPS mínimo
     if tps < MIN_TPS:
         slas_passed = False
-        sla_reasons.append(
-            f"TPS {tps:.2f} < mínimo requerido {MIN_TPS}."
-        )
+        sla_reasons.append(f"TPS {tps:.2f} < mínimo requerido {MIN_TPS}.")
     else:
-        sla_reasons.append(
-            f"TPS {tps:.2f} ≥ mínimo requerido {MIN_TPS} (OK)."
-        )
+        sla_reasons.append(f"TPS {tps:.2f} ≥ mínimo requerido {MIN_TPS} (OK).")
 
-    # =========================================================
-    # RESUMEN EN CONSOLA
-    # =========================================================
-    print("\n--- Resultados de Rendimiento ---")
-    print(f"Muestras Totales       : {total_samples}")
-    print(f"Muestras OK / KO       : {samples_ok} / {samples_ko}")
-    print(f"Duración Total Prueba  : {total_duration_s:.2f} s")
-    print(f"Tasa de Error Global   : {error_rate:.2f}% (Máx SLA: {MAX_ERROR_RATE_TOTAL}%)")
-    print(f"Latencia Promedio      : {avg_latency:.2f} ms (Máx SLA: {MAX_AVG_LATENCY} ms)")
-    print(f"Transacciones por Seg. : {tps:.2f} tps (Mín SLA: {MIN_TPS} tps)")
-    print(f"Percentiles Latencia   : p90={p90:.2f} ms, p95={p95:.2f} ms")
-    print(f"HTTP 5xx               : {http_500}")
-    print("---------------------------------\n")
-
-    if slas_passed:
-        print("✅ VALIDACIÓN DE SLA EXITOSA. Todas las métricas cumplen los umbrales.")
-    else:
-        print("🚨 FALLO EN LA VALIDACIÓN DE SLA. Uno o más umbrales no se cumplieron.")
-
-    print("\n--- Detalle Evaluación SLA ---")
-    for r in sla_reasons:
-        print(f"- {r}")
-    print("---------------------------------\n")
-
-    # =========================================================
-    # GENERACIÓN DE summary.json
-    # =========================================================
-
-    # Datos de contexto (pueden venir desde Jenkins por variables de entorno)
-    test_name = os.environ.get("TEST_NAME") or os.path.basename(jtl_file)
-    threads   = int(os.environ.get("THREADS", "0") or 0)
-    rampup    = int(os.environ.get("RAMP_UP", "0") or 0)
-    duration  = int(os.environ.get("DURATION", "0") or 0)
-
+    # =========================
+    # summary.json
+    # =========================
     summary = {
         "test_name": test_name,
-        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": utc_now_iso(),
 
-        "threads": threads,
-        "rampup": rampup,
-        "duration": duration,
+        "threads": int(threads),
+        "rampup": int(rampup),
+        "duration": int(duration),
+
+        "repo": (repo or "").strip(),
+        "jmx": (jmx or "").strip(),
 
         "samples_total": total_samples,
         "samples_ok": samples_ok,
@@ -214,35 +174,39 @@ def check_slas(jtl_file: str) -> None:
     }
 
     try:
-        with open("summary.json", "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        print("summary.json generado correctamente.")
+        print(f"OK: {out_path} generado. threads={threads}, rampup={rampup}, duration={duration}")
     except Exception as e:
-        print(f"ERROR al escribir summary.json: {e}")
+        print(f"ERROR al escribir {out_path}: {e}")
+        return 1
 
-    # =========================================================
-    # CÓDIGO DE SALIDA (para Jenkins)
-    # =========================================================
-    sys.exit(0 if slas_passed else 1)
-
-
-# =========================================================
-# === Punto de entrada ===
-# =========================================================
+    return 0 if slas_passed else 1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("jtl_file")
+
     parser.add_argument("--threads",  type=str, default=os.getenv("THREADS", "0"))
     parser.add_argument("--rampup",   type=str, default=os.getenv("RAMP_UP", "0"))
     parser.add_argument("--duration", type=str, default=os.getenv("DURATION", "0"))
+
+    parser.add_argument("--repo", type=str, default=os.getenv("JMX_URL", ""))
+    parser.add_argument("--jmx",  type=str, default=os.getenv("JMX_FILE", ""))
+    parser.add_argument("--out",  type=str, default="summary.json")
+    parser.add_argument("--test-name", type=str, default=os.getenv("TEST_NAME", ""))
+
     args = parser.parse_args()
 
-    # Si tu script ya genera summary.json, usa args.threads/args.rampup/args.duration
-    # cuando armes el JSON. Ej:
-    # summary["threads"] = float(args.threads) si viene numérico o déjalo string.
-    # summary["rampup"] = float(args.rampup)
-    # summary["duration"] = float(args.duration)
-
-    check_slas(args.jtl_file)
-
+    test_name = (args.test_name or os.path.basename(args.jtl_file)).strip()
+    exit_code = check_slas(
+        jtl_file=args.jtl_file,
+        threads=safe_int(args.threads, 0),
+        rampup=safe_int(args.rampup, 0),
+        duration=safe_int(args.duration, 0),
+        test_name=test_name,
+        repo=args.repo,
+        jmx=args.jmx,
+        out_path=args.out,
+    )
+    sys.exit(exit_code)
